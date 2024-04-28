@@ -35,33 +35,43 @@
 #' but is recorded as a BED file. In this case, use \code{c(1, 0)} (default value).
 #' If unsure, set to \code{"guess"},
 #' in which case the program returns a guess.
+#' @param barcodesuffix Add suffix to barcodes per targetregions.
+#' @param dobptonext (experimental feature) Whether to compute smoothed distance
+#' to the next fragment (irrelevant to BC) as bptonext,
+#' which is the inverse of chromatin accessibility, and append as 9th to 14th columns.
 #' @return A tibble with each row corresponding to a cell.
 #' For each cell, its barcode, the total count of the fragments \code{nfrag},
 #' and the count distinguished by overlap depth are given.
 #'
-#' @importFrom dplyr arrange desc distinct group_by lag mutate n rename summarize ungroup
+#' @importFrom dplyr arrange desc distinct filter group_by lag left_join mutate n rename summarize ungroup
 #' @importFrom GenomicRanges findOverlaps makeGRangesFromDataFrame
 #' @importFrom rlang .data
+#' @importFrom tidyr pivot_wider
 #' @importFrom Rsamtools scanTabix TabixFile
+#' @importFrom stats ksmooth
 #' @importFrom utils read.csv setTxtProgressBar txtProgressBar
 #' @export
 fragmentoverlapcount = function (file,
                                  targetregions,
                                  excluderegions = NULL,
                                  targetbarcodes = NULL,
-                                 Tn5offset = c(1, 0)) {
-  sumoverlaplist = list()
+                                 Tn5offset = c(1, 0),
+                                 barcodesuffix = NULL,
+                                 dobptonext = FALSE) {
+  fragmentoverlaplist = list()
   tbx = TabixFile(file = file)
   pb = txtProgressBar(max = length(targetregions), style = 3)
   for (i in 1:length(targetregions)) {
 
     # Load fragments.
     res = scanTabix(tbx, param = targetregions[i])
+    if (length(res[[1]]) == 0) { next() }
     frags = read.csv(textConnection(res[[1]]),
                      sep = "\t",
                      header = FALSE)
     frags = frags[, 1:4]
     colnames(frags) = c("chr", "start", "end", "BC")
+    rm(res)
 
     if (! is.null(targetbarcodes)) {
       frags = frags[frags$BC %in% targetbarcodes, ]
@@ -139,27 +149,96 @@ fragmentoverlapcount = function (file,
                 depth5 = sum(.data$overlapcount == 4),
                 depth6 = sum(.data$overlapcount == 5))
 
-    sumoverlaplist = c(sumoverlaplist, list(fragsbyBC))
+    if (dobptonext) {
+      # Compute smoothed distance to the next fragment (irrelevant to BC) as bptonext,
+      # which is the inverse of chromatin accessibility.
+      compute_smoothed_distance =
+        function(frags) {
+          if (nrow(frags) > 1) {
+            smoothed_starts = ksmooth(
+              1:nrow(frags),
+              frags$start,
+              bandwidth = 200,
+              n.points = nrow(frags))$y
+            differences = diff(smoothed_starts)
+            differences = c(differences, differences[length(differences)])
+            frags$bptonext = pmax(differences, 0)
+          } else {
+            frags$bptonext = Inf
+          }
+          return(frags)
+        }
+
+      # Convert bptonext into a list format
+      bptonext_as_list =
+        function(frags) {
+          list_data = frags %>%
+            mutate(depth = .data$overlapcount + 1) %>%
+            dplyr::filter(.data$depth <= 6) %>%
+            group_by(.data$BC, .data$depth) %>%
+            summarize(bptonext = list(.data$bptonext), .groups = "drop")
+          widened_data = pivot_wider(
+            list_data,
+            names_prefix = "bptonextdepth",
+            names_from = "depth",
+            values_from = "bptonext"
+          )
+          for (i in setdiff(paste0("bptonextdepth", 1:6), colnames(widened_data))) {
+            widened_data[[i]] = list(NULL)
+          }
+          return(widened_data)
+        }
+
+      frags = compute_smoothed_distance(frags)
+      bptonext_list_data = bptonext_as_list(frags)
+      fragsbyBC = left_join(fragsbyBC, bptonext_list_data, by = 'BC')
+    }
+
+    if (! is.null(barcodesuffix)) {
+      fragsbyBC$BC = paste0(fragsbyBC$BC, barcodesuffix[i])
+    }
+
+    fragmentoverlaplist = c(fragmentoverlaplist, list(fragsbyBC))
     setTxtProgressBar(pb, i)
   }
   close(pb)
-  if (identical(sumoverlaplist, list())) {
+  if (identical(fragmentoverlaplist, list())) {
     stop('Error: no fragments remained after filtering')
   }
 
-  sumoverlap =
-    do.call(rbind, sumoverlaplist) %>%
-    group_by(.data$BC) %>%
-    summarize(nfrags = sum(.data$nfrags),
-              depth1 = sum(.data$depth1),
-              depth2 = sum(.data$depth2),
-              depth3 = sum(.data$depth3),
-              depth4 = sum(.data$depth4),
-              depth5 = sum(.data$depth5),
-              depth6 = sum(.data$depth6))
-  sumoverlap = sumoverlap %>%
-    rename(barcode = .data$BC)
-  return(sumoverlap)
+  if (dobptonext) {
+    fragmentoverlap =
+      do.call(rbind, fragmentoverlaplist) %>%
+      group_by(.data$BC) %>%
+      summarize(nfrags = sum(.data$nfrags),
+                depth1 = sum(.data$depth1),
+                depth2 = sum(.data$depth2),
+                depth3 = sum(.data$depth3),
+                depth4 = sum(.data$depth4),
+                depth5 = sum(.data$depth5),
+                depth6 = sum(.data$depth6),
+                bptonextdepth1 = list(do.call(c, .data$bptonextdepth1)),
+                bptonextdepth2 = list(do.call(c, .data$bptonextdepth2)),
+                bptonextdepth3 = list(do.call(c, .data$bptonextdepth3)),
+                bptonextdepth4 = list(do.call(c, .data$bptonextdepth4)),
+                bptonextdepth5 = list(do.call(c, .data$bptonextdepth5)),
+                bptonextdepth6 = list(do.call(c, .data$bptonextdepth6)))
+  } else {
+    fragmentoverlap =
+      do.call(rbind, fragmentoverlaplist) %>%
+      group_by(.data$BC) %>%
+      summarize(nfrags = sum(.data$nfrags),
+                depth1 = sum(.data$depth1),
+                depth2 = sum(.data$depth2),
+                depth3 = sum(.data$depth3),
+                depth4 = sum(.data$depth4),
+                depth5 = sum(.data$depth5),
+                depth6 = sum(.data$depth6))
+  }
+
+  fragmentoverlap = fragmentoverlap %>%
+    rename(barcode = "BC")
+  return(fragmentoverlap)
 }
 
 # A utility function.
@@ -181,6 +260,28 @@ fragmentoverlapcount = function (file,
     return(ct)
   }
 
+# A utility function.
+# Computes a "capped" version of the log-transformed T2T1 values.
+# The capping is done based on the interquartile range of the log-transformed values.
+.cap = function (logT2T1) {
+  if (is.finite(quantile(logT2T1, 0.25))) {
+    x = 2 * quantile(logT2T1, 0.75) -
+      quantile(logT2T1, 0.5)
+    logT2T1capped = pmin(logT2T1, x)
+    x = 2 * quantile(logT2T1, 0.25) -
+      quantile(logT2T1, 0.5)
+    logT2T1capped = pmax(logT2T1capped, x)
+    # Although unlikely, adjust if -Inf remains.
+    x = min(logT2T1capped[is.finite(logT2T1capped)])
+    logT2T1capped = pmax(logT2T1capped, x)
+  } else {
+    warning("1st Qu. == -Inf")
+    x = min(logT2T1[is.finite(logT2T1)])
+    logT2T1capped = pmax(logT2T1, x)
+  }
+  return(logT2T1capped)
+}
+
 #' Infer Ploidy from ATAC-seq Fragment Overlap
 #'
 #' @param fragmentoverlap Frequency of fragment overlap in each cell
@@ -189,118 +290,173 @@ fragmentoverlapcount = function (file,
 #' \code{c(2, 4)} if the cells can be diploids or tetraploids.
 #' The values must be larger than one.
 #' @param s Seed for random numbers used in EM algorithm.
+#' @param epsilon Convergence criterion for the EM algorithm.
+#' @param subsamplesize EM algorithm becomes difficult to converge
+#' when the number of cells is very large.
+#' By setting the parameter (e.g. to 1e4),
+#' we can run EM algorithm iteratively,
+#' first for \code{subsamplesize} randomly sampled cells,
+#' next for twice the number of cells in repetition.
+#' The inferred lambda/theta parameters are used as the initial value
+#' in the next repetition.
+#' @param dobayes (experimental feature) Whether to perform Bayesian inference,
+#' which takes long computation time.
+#' @param prop Proportion of peaks that can be fitted with binomal
+#' distribution in ploidy.bayes. The rest of peaks are allowed to
+#' have depth larger than the ploidy.
 #' @return A data.frame with each row corresponding to a cell.
-#' For each cell, its barcode, ploidy inferred by moment method,
-#' the same with additional K-means clustering,
-#' and ploidy inferred by EM algorithm of mixture are given.
-#' I recommend using \code{ploidy.moment}.
+#' For each cell, its barcode, ploidy inferred by 1) moment method,
+#' 2) the same with additional K-means clustering,
+#' 3) EM algorithm of mixture, and, optionally,
+#' 4) Bayesian inference are given.
+#' I recommend using \code{ploidy.moment} or \code{ploidy.em}.
+#' When \code{fragmentoverlapcount} was computed with \code{dobptonext=TRUE},
+#' we only use the chromosomal sites with chromatin accessibility in top 10%.
+#' This requires longer computation time.
 #'
-#' @importFrom matrixStats rowMins
+#' @importFrom matrixStats colMins
 #' @importFrom mixtools multmixEM
-#' @importFrom stats kmeans
+#' @import nimble
+#' @importFrom stats dbinom dpois kmeans optimize quantile
 #' @export
 ploidy = function (fragmentoverlap,
                    levels,
-                   s = 100) {
+                   s = 100,
+                   epsilon = 1e-08,
+                   subsamplesize = NULL,
+                   dobayes = FALSE,
+                   prop = 0.9) {
   if (min(levels) <= 1) {
     stop('Error: elements of levels must be larger than one')
   }
 
-  ### MOMENT BASED METHOD
-  # We model the overlapping of fragments by binomial distribution:
-  # ------------------------------------------------------------
-  # binomial distribution   | overlap of fragments   | parameter
-  # ------------------------------------------------------------
-  # one observation         | 5' end of a fragment   |
-  # number of trials (size) | ploidy                 | p
-  # number of success       | depth of overlap       |
-  # probability of success  | probability of overlap | s
-  # ------------------------------------------------------------
-  # Under a predetermined p, for each cell, we estimate s based on
-  # the overlap depth observed in the fragments belonging to the cell.
-  # Since we cannot properly count observations with zero success,
-  # we model as truncated binomial distribution.
-  # We use the moment method in Paul R. Rider (1955).
-  smat =
-    do.call(
-      cbind,
-      lapply(
-        levels,
-        function (p) {
-          x = as.matrix(fragmentoverlap[, -(1:2)])
-          if (p < ncol(x)) {
-            x = cbind(x[, 1:(p-1)], rowSums(x[, p:ncol(x)]))
-          }
-          T0 = x %*% rep(1, ncol(x))
-          T1 = x %*% seq(1, ncol(x))
-          T2 = x %*% (seq(1, ncol(x))^2)
-          s = (T2 - T1) / ((p - 1) * T1)
-          return(s)
-        }))
-  # For a cell with all fragments having depth 1,
-  # T1 == T2 and s == 0.
-  # We replace these with smallest non-zero s computed from all cells.
-  for (i in 1:ncol(smat)) {
-    smat[smat[, i] == 0, i] = min(smat[smat[, i] > 0, i])
-  }
-  # We seek s that is concordant across all cells.
-  # In each cell, p is allowed to take any value from levels.
-  smat = log10(smat)
-  scandidates = sort(as.numeric(smat))
-  scandidatespenalty =
-    as.numeric(
-      lapply(
-        scandidates,
-        function (s) {
-          sum(matrixStats::rowMins(abs(smat - s)))
-        }))
-  soptimal = scandidates[which.min(scandidatespenalty)]
-  # Adopting the probability soptimal,
-  # infer ploidy of each cell.
-  p.moment = apply(
-    abs(smat - soptimal),
-    1,
-    which.min)
-  p.moment = levels[p.moment]
-
-  ### EM ALGORITHM FOR MIXTURES
-  # We superficially (and possibly robustly) model
-  # as mixtures of multinomial distributions
-  # We first try with (depth2, depth3, depth4),
-  # but if the clusters don't separate,
-  # next try (depth3, depth4, depth5), and so on.
-  for (j in 4:6) {
-    sumoverlapsubmatrix =
-      as.matrix(fragmentoverlap[, 0:2 + j])
-    set.seed(s)
-    em.out = multmixEM(
-      y = sumoverlapsubmatrix,
-      k = length(levels))
-    if (max(em.out$lambda) < 0.99) { break }
-  }
-  p.em = apply(em.out$posterior, 1, which.max)
-  # EM is simple clustering and unaware of the labeling in levels.
-  # We infer the labeling from the last element of theta,
-  # which represents the overlaps of largest depth used for clustering.
-  p.em = (levels[order(em.out$theta[, 3])])[p.em]
-
-  ### K-MEANS POST-PROCESSING OF MOMENT
-  x = log10(
-    (fragmentoverlap[, 4:6] + 1) / fragmentoverlap$nfrags)
-  kmclust =
-    kmeans(
-      x,
+  ### SUBTOTAL fragmentoverlap BY bptonext CLASSES
+  if (ncol(fragmentoverlap) > 8) {
+    # Unnest bptonext, classify by breaks, and count.
+    countbybptonext = function (data, breaks) {
+      colnames(data) = c("barcode", "bptonext")
+      data = tidyr::unnest(data, "bptonext")
+      if (nrow(data) > 0) {
+        data$bptonextclass = cut(data$bptonext, breaks, include.lowest = TRUE)
+      } else {
+        data$bptonextclass = character(0)
+      }
+      data = data %>%
+        group_by(.data$barcode, .data$bptonextclass) %>%
+        summarize(n = n(), .groups = "drop")
+      return(data)
+    }
+    # Compute deciles of bptonextall.
+    bptonextall =
+      do.call(c,
+              lapply(fragmentoverlap[, 9:14],
+                     function (x) { do.call(c, x) }))
+    breaks = unique(quantile(bptonextall, seq(0, 1, 0.1)))
+    rm(bptonextall)
+    gc()
+    # grouping in rows by value: barcode, bptonextclass, depth
+    # value: n
+    fragmentoverlapbybptonext =
       do.call(
         rbind,
-        tapply(
-          as.list(as.data.frame(t(x))),
-          p.moment,
-          function (x) {rowMeans(do.call(cbind, x))})))
-  p.kmeans = levels[kmclust$cluster]
+        lapply(
+          1:6,
+          function (d) {
+            x = countbybptonext(
+              fragmentoverlap[, c("barcode", paste0("bptonextdepth", d))],
+              breaks)
+            x$depth = d
+            return(x)
+          }))
+    # grouping in rows by value: barcode, bptonextclass
+    # grouping in columns by name: depth
+    # value: n
+    fragmentoverlapbybptonext =
+      pivot_wider(
+        fragmentoverlapbybptonext,
+        names_from = "depth",
+        names_prefix = "depth",
+        values_from = "n")
+    fragmentoverlapbybptonext[is.na(fragmentoverlapbybptonext)] = 0
+    bptonextlevels =
+      levels(fragmentoverlapbybptonext$bptonextclass)
+    # grouping in list: bptonextclass
+    # grouping in rows by value: barcode
+    # grouping in columns by name: depth
+    # value: n
+    fragmentoverlapbybptonext = lapply(
+      bptonextlevels,
+      function (l) {
+        x =
+          fragmentoverlapbybptonext[
+            fragmentoverlapbybptonext$bptonextclass == l, ]
+        # Make barcode consistent with fragmentoverlap
+        x = x[match(fragmentoverlap$barcode, x$barcode), ]
+        x[is.na(x)] = 0
+        m = as.matrix(x[, -c(1:2)])
+        rownames(m) = x$barcode
+        return(m)
+      })
+    names(fragmentoverlapbybptonext) = bptonextlevels
+  }
 
-  return(data.frame(
+  if (ncol(fragmentoverlap) <= 8) {
+    x = as.matrix(fragmentoverlap[, 3:8])
+    T1 = as.numeric(x %*% seq(1, ncol(x)))
+    T2 = as.numeric(x %*% (seq(1, ncol(x))^2))
+    logT2T1 = log(T2 / T1 - 1)
+    x = inferpmoment(.cap(logT2T1), levels)
+    p.moment = x$p.moment
+    offset = x$offset
+    # exp(offset) is the estimate for 1/s
+    p.momentfractional = exp(logT2T1) * exp(offset) + 1
+    p.kmeans = inferpkmeans(fragmentoverlap, levels, p.moment)
+    p.em = inferpem(fragmentoverlap, levels, s, epsilon, subsamplesize)
+    if (dobayes) {
+      ploidy.bayes = inferpbayes(as.matrix(fragmentoverlap[, 3:8]), levels, prop, p.moment)
+    }
+  } else {
+    # grouping in list: bptonextclass
+    # name: barcode
+    # value: logT2T1
+    logT2T1bybptonext = lapply(
+      fragmentoverlapbybptonext,
+      function (x) {
+        T1 = as.numeric(x %*% seq(1, ncol(x)))
+        T2 = as.numeric(x %*% (seq(1, ncol(x))^2))
+        T2T1 = T2 / T1 - 1
+        logT2T1 = log(T2T1)
+        names(logT2T1) = rownames(x)
+        return(logT2T1)
+      }
+    )
+
+    x = inferpmoment(.cap(logT2T1bybptonext[[1]]), levels)
+    p.moment = x$p.moment
+    offset = x$offset
+    p.momentfractional = exp(logT2T1bybptonext[[1]]) * exp(offset) + 1
+    fragmentoverlap1 = cbind(
+      data.frame(
+        barcode = fragmentoverlap$barcode,
+        nfrags = rowSums(fragmentoverlapbybptonext[[1]])),
+      fragmentoverlapbybptonext[[1]])
+    p.kmeans = inferpkmeans(fragmentoverlap1, levels, p.moment)
+    p.em = inferpem(fragmentoverlap1, levels, s, epsilon, subsamplesize)
+    if (dobayes) {
+      x = fragmentoverlapbybptonext[[1]]
+      for (j in setdiff(1:6, 1:ncol(x))) { x = cbind(x, 0) } # pad if max depth < 6
+      ploidy.bayes = inferpbayes(x, levels, prop, p.moment)
+    }
+  }
+
+  output = data.frame(
     barcode = fragmentoverlap$barcode,
     ploidy.moment = p.moment,
+    ploidy.momentfractional = p.momentfractional,
     ploidy.kmeans = p.kmeans,
-    ploidy.em = p.em))
+    ploidy.em = p.em)
+  if (dobayes) {
+    output$ploidy.bayes = ploidy.bayes$ploidy.bayes
+  }
+  return(output)
 }

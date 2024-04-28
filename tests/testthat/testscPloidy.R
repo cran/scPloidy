@@ -1,6 +1,12 @@
 library(scPloidy)
 
 test_that("fragmentoverlapcount works", {
+  skip_if_not_installed("GenomicRanges")
+  skip_if_not_installed("IRanges")
+  skip_if_not_installed("readr")
+  library(GenomicRanges)
+  library(IRanges)
+  library(readr)
   targetregions =
     GenomicRanges::GRanges(
       c("chr19", "chr20"),
@@ -20,7 +26,7 @@ test_that("fragmentoverlapcount works", {
       test_path("testdata/SHR_m154211.10cells.chr19_20.fragments.txt.gz"),
       targetregions,
       excluderegions = simpleRepeat,
-      Tn5offset = c(0, -9)),
+      Tn5offset = c(0, -9))[, 1:8],
     resfragmentoverlapcount)
 })
 
@@ -33,4 +39,18 @@ test_that("ploidy works", {
     ploidy(fragmentoverlap,
            c(2, 4, 8)),
     resploidy)
+})
+
+test_that("cnv works", {
+  data(GSE129785_SU008_Tumor_Pre)
+  x = cnv(SU008_Tumor_Pre_fragmentoverlap,
+          SU008_Tumor_Pre_windowcovariates,
+          levels = c(2, 4),
+          deltaBICthreshold = -600)
+  expect_equal(
+    x$CNV,
+    rescnv$CNV)
+  expect_equal(
+    x$cellwindowCN,
+    rescnv$cellwindowCN)
 })

@@ -1,11 +1,19 @@
-## ---- include = FALSE---------------------------------------------------------
+## ----include = FALSE----------------------------------------------------------
 knitr::opts_chunk$set(
   collapse = TRUE,
   comment = "#>"
 )
 
+has_pkg = requireNamespace("GenomicRanges", quietly = TRUE) &&
+  requireNamespace("IRanges", quietly = TRUE) &&
+  requireNamespace("readr", quietly = TRUE)
+knitr::opts_chunk$set(eval = has_pkg)
+
 ## ----setup--------------------------------------------------------------------
 library(scPloidy)
+library(GenomicRanges)
+library(IRanges)
+library(readr)
 
 ## -----------------------------------------------------------------------------
 ?fragmentoverlapcount
@@ -54,6 +62,6 @@ cells = SHR_m154211$cells
 table(cells$celltype,
       p$ploidy.moment[match(cells$barcode, p$barcode)])
 
-## ---- eval = FALSE------------------------------------------------------------
+## ----eval = FALSE-------------------------------------------------------------
 #  system.file("perl", "samtofragmentbed.pl", package = "scPloidy")
 
